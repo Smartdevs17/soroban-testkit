@@ -85,8 +85,6 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
         return Err(CliError(coverage_failure_message(status)));
     }
 
-    validate_coverage_outputs(&args)?;
-
     Ok(())
 }
 

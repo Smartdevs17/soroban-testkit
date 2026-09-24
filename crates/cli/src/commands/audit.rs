@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use syn::visit::{self, Visit};
@@ -14,16 +15,30 @@ use super::CliError;
 /// Arguments for `soroban-testkit audit`.
 #[derive(Args)]
 pub struct AuditArgs {
+    #[command(subcommand)]
+    command: Option<AuditCommand>,
     /// Path to the contract crate to audit (its `.rs` files are scanned
     /// recursively), or `-` to scan Rust source from stdin.
-    #[arg(value_name = "PATH", default_value = ".")]
+    #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
     /// Exit non-zero if any findings are reported.
-    #[arg(long)]
+    #[arg(long, global = true)]
     strict: bool,
     /// Output format. JSON and SARIF are intended for automation and code scanning.
-    #[arg(long, value_enum, default_value_t = AuditOutputFormat::Text)]
+    #[arg(long, value_enum, default_value_t = AuditOutputFormat::Text, global = true)]
     format: AuditOutputFormat,
+    /// Path to a baseline file containing findings to ignore.
+    #[arg(long, global = true)]
+    baseline: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Explain a specific audit rule.
+    Explain {
+        /// Rule ID to explain.
+        rule: String,
+    },
 }
 
 /// Machine- and human-readable audit output formats.
@@ -67,8 +82,23 @@ struct Finding {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BaselineEntry {
+    file: String,
+    line: usize,
+    rule: String,
+}
+
+impl Finding {
+    fn matches_baseline(&self, entry: &BaselineEntry) -> bool {
+        self.file.to_string_lossy() == entry.file
+            && self.line == entry.line
+            && self.rule == entry.rule
+    }
+}
+
 /// Static checks over a contract crate. **Not a security product** — a
-/// linter with six heuristics, each independently useful and each
+/// linter with seven heuristics, each independently useful and each
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
@@ -81,8 +111,14 @@ struct Finding {
 /// 4. Broad use of `mock_all_auths` in test functions.
 /// 5. Token transfer calls whose return value is explicitly or implicitly ignored.
 /// 6. Signed `amount` parameters with no comparison against zero.
+/// 7. Unchecked timestamp arithmetic operations that could overflow.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
+    if let Some(AuditCommand::Explain { rule }) = &args.command {
+        return explain_rule(rule);
+    }
+
     let config = load_config(&args.path)?;
+    let baseline = load_baseline(&args.baseline)?;
     let mut findings = Vec::new();
 
     if args.path == Path::new("-") {
@@ -90,7 +126,13 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         std::io::stdin()
             .read_to_string(&mut source)
             .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
-        audit_source(Path::new("<stdin>"), &source, &mut findings, &config)?;
+        audit_source(
+            Path::new("<stdin>"),
+            &source,
+            &mut findings,
+            &config,
+            &source,
+        )?;
     } else {
         for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
@@ -103,6 +145,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
     }
 
+    findings.retain(|f| !baseline.iter().any(|b| f.matches_baseline(b)));
+
     print!("{}", render_findings(&findings, args.format)?);
 
     if args.strict && !findings.is_empty() {
@@ -111,6 +155,56 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             findings.len()
         )));
     }
+    Ok(())
+}
+
+fn explain_rule(rule: &str) -> Result<(), CliError> {
+    let explanation = match rule {
+        "missing-require-auth" => {
+            "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
+             This rule detects functions with Address parameters that never call require_auth().\n\
+             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
+        }
+        "unchecked-i128-arithmetic" => {
+            "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
+             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
+             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html"
+        }
+        "missing-ttl-bump" => {
+            "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
+             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data"
+        }
+        "broad-mock-all-auths" => {
+            "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
+             This rule detects mock_all_auths in test functions.\n\
+             Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing"
+        }
+        "ignored-token-transfer-result" => {
+            "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
+             This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
+             Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
+        }
+        "missing-positive-amount-validation" => {
+            "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
+             This rule detects amount parameters (signed integers) with no comparison against zero.\n\
+             Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
+        }
+        "unchecked-timestamp-arithmetic" => {
+            "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
+             This rule detects + - * / operations on timestamp values without overflow protection.\n\
+             Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
+        }
+        _ => return Err(CliError(format!("unknown rule: {}", rule))),
+    };
+    println!("{}", explanation);
     Ok(())
 }
 
@@ -146,7 +240,7 @@ fn render_text(findings: &[Finding]) -> String {
         ));
     }
     output.push_str(&format!(
-        "\n{} finding(s). soroban-testkit audit is a linter with six heuristics, not a \
+        "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
          security product — a missing finding is not a security guarantee.\n",
         findings.len()
     ));
@@ -218,6 +312,19 @@ fn load_config(root: &Path) -> Result<AuditConfig, CliError> {
     Ok(AuditConfig::default())
 }
 
+fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, CliError> {
+    match baseline_path {
+        Some(path) => {
+            let content = fs::read_to_string(path)
+                .map_err(|err| CliError(format!("failed to read baseline file: {err}")))?;
+            let entries: Vec<BaselineEntry> = serde_json::from_str(&content)
+                .map_err(|err| CliError(format!("failed to parse baseline JSON: {err}")))?;
+            Ok(entries)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 fn audit_file(
     path: &Path,
     findings: &mut Vec<Finding>,
@@ -225,7 +332,7 @@ fn audit_file(
 ) -> Result<(), CliError> {
     let src = std::fs::read_to_string(path)
         .map_err(|err| CliError(format!("failed to read {}: {err}", path.display())))?;
-    audit_source(path, &src, findings, config)
+    audit_source(path, &src, findings, config, &src)
 }
 
 fn audit_source(
@@ -233,25 +340,72 @@ fn audit_source(
     src: &str,
     findings: &mut Vec<Finding>,
     config: &AuditConfig,
+    full_src: &str,
 ) -> Result<(), CliError> {
     let file = match syn::parse_file(src) {
         Ok(file) => file,
         Err(_) => return Ok(()), // Not every .rs file under a crate root need parse standalone.
     };
 
+    let suppressions = extract_suppressions(full_src);
+
+    let suppressions = Vec::new();
     let mut visitor = FunctionVisitor {
         path: path.to_path_buf(),
         findings,
         config,
+        suppressions: &suppressions,
     };
     visitor.visit_file(&file);
     Ok(())
+}
+
+struct Suppression {
+    line: usize,
+    rules: Vec<String>,
+    reason: Option<String>,
+}
+
+fn extract_suppressions(src: &str) -> Vec<Suppression> {
+    let mut suppressions = Vec::new();
+    for (idx, line) in src.lines().enumerate() {
+        if let Some(comment_start) = line.find("soroban_testkit::audit(skip") {
+            if let Some(comment_text) = line[comment_start..].split_once('(') {
+                if let Some(end_paren) = comment_text.1.rfind(')') {
+                    let content = &comment_text.1[..end_paren];
+                    let mut rules = Vec::new();
+                    let mut reason = None;
+
+                    for part in content.split(',') {
+                        let part = part.trim();
+                        if part.starts_with("reason=") {
+                            reason = Some(part[7..].trim_matches('"').to_string());
+                        } else if !part.is_empty() && part != "skip" {
+                            rules.push(part.to_string());
+                        }
+                    }
+
+                    if rules.is_empty() {
+                        rules.push("*".to_string());
+                    }
+
+                    suppressions.push(Suppression {
+                        line: idx + 1,
+                        rules,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+    suppressions
 }
 
 struct FunctionVisitor<'a> {
     path: PathBuf,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
@@ -334,6 +488,30 @@ impl FunctionVisitor<'_> {
                 }
             }
         }
+
+        // Rule 7: unchecked timestamp arithmetic
+        if self.is_enabled("unchecked-timestamp-arithmetic") {
+            let has_timestamp_ops = body_src.contains("timestamp")
+                && (body_src.contains("+")
+                    || body_src.contains("-")
+                    || body_src.contains("*")
+                    || body_src.contains("/"));
+            let is_checked = body_src.contains("checked_") || body_src.contains("saturating_");
+
+            if has_timestamp_ops && !is_checked && body_src.contains("timestamp") {
+                // Check if it's likely timestamp arithmetic
+                if body_src.contains("timestamp()") || body_src.contains("timestamp ") {
+                    self.push(
+                        line,
+                        "unchecked-timestamp-arithmetic",
+                        "warning",
+                        format!(
+                            "fn {name} performs arithmetic on timestamp values; use checked arithmetic to prevent overflow"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn audit_mock_all_auths(&mut self, body_src: &str, line: usize, fn_name: &str) {
@@ -377,6 +555,17 @@ impl FunctionVisitor<'_> {
             return;
         }
 
+        // Check if this finding is suppressed
+        for suppression in self.suppressions {
+            if (suppression.line == line || suppression.line == line - 1) {
+                if suppression.rules.contains(&"*".to_string())
+                    || suppression.rules.iter().any(|r| r == rule)
+                {
+                    return;
+                }
+            }
+        }
+
         let severity = self
             .config
             .rules
@@ -416,6 +605,7 @@ impl FunctionVisitor<'_> {
             i128_bindings,
             findings: self.findings,
             config: self.config,
+            suppressions: self.suppressions,
         };
         visitor.visit_block(body);
     }
@@ -430,6 +620,7 @@ impl FunctionVisitor<'_> {
             fn_name: sig.ident.to_string(),
             findings: self.findings,
             config: self.config,
+            suppressions: self.suppressions,
         };
         visitor.visit_block(body);
     }
@@ -520,6 +711,7 @@ struct IgnoredTransferVisitor<'a> {
     fn_name: String,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
 }
 
 impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
@@ -539,23 +731,33 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
         };
 
         if let Some(expr) = ignored_call {
-            let severity = self
-                .config
-                .rules
-                .get("ignored-token-transfer-result")
-                .and_then(|rule| rule.severity.as_deref())
-                .unwrap_or("warning");
-            let method = transfer_method_name(expr).unwrap_or("transfer");
-            self.findings.push(Finding {
-                file: self.path.clone(),
-                line: line_of(expr),
-                rule: "ignored-token-transfer-result",
-                severity: severity.to_string(),
-                message: format!(
-                    "fn {} ignores the result of token `{method}`; propagate, match, or bind the result",
-                    self.fn_name
-                ),
+            let line = line_of(expr);
+            let is_suppressed = self.suppressions.iter().any(|s| {
+                (s.line == line || s.line == line - 1)
+                    && (s.rules.contains(&"*".to_string())
+                        || s.rules
+                            .contains(&"ignored-token-transfer-result".to_string()))
             });
+
+            if !is_suppressed {
+                let severity = self
+                    .config
+                    .rules
+                    .get("ignored-token-transfer-result")
+                    .and_then(|rule| rule.severity.as_deref())
+                    .unwrap_or("warning");
+                let method = transfer_method_name(expr).unwrap_or("transfer");
+                self.findings.push(Finding {
+                    file: self.path.clone(),
+                    line,
+                    rule: "ignored-token-transfer-result",
+                    severity: severity.to_string(),
+                    message: format!(
+                        "fn {} ignores the result of token `{method}`; propagate, match, or bind the result",
+                        self.fn_name
+                    ),
+                });
+            }
         }
 
         visit::visit_stmt(self, node);
@@ -602,6 +804,7 @@ struct I128ArithmeticVisitor<'a> {
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
 }
 
 impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
@@ -622,24 +825,32 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
             BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
         );
         if is_arith && (self.touches_i128(&node.left) || self.touches_i128(&node.right)) {
-            let severity = self
-                .config
-                .rules
-                .get("unchecked-i128-arithmetic")
-                .and_then(|r| r.severity.as_deref())
-                .unwrap_or("warning");
-
-            self.findings.push(Finding {
-                file: self.path.clone(),
-                line: self.fn_line,
-                rule: "unchecked-i128-arithmetic",
-                severity: severity.to_string(),
-                message: format!(
-                    "fn {} does raw arithmetic on an i128 value; prefer checked_/saturating_/ \
-                     wrapping_ variants to avoid silent overflow",
-                    self.fn_name
-                ),
+            let is_suppressed = self.suppressions.iter().any(|s| {
+                (s.line == self.fn_line || s.line == self.fn_line - 1)
+                    && (s.rules.contains(&"*".to_string())
+                        || s.rules.contains(&"unchecked-i128-arithmetic".to_string()))
             });
+
+            if !is_suppressed {
+                let severity = self
+                    .config
+                    .rules
+                    .get("unchecked-i128-arithmetic")
+                    .and_then(|r| r.severity.as_deref())
+                    .unwrap_or("warning");
+
+                self.findings.push(Finding {
+                    file: self.path.clone(),
+                    line: self.fn_line,
+                    rule: "unchecked-i128-arithmetic",
+                    severity: severity.to_string(),
+                    message: format!(
+                        "fn {} does raw arithmetic on an i128 value; prefer checked_/saturating_/ \
+                         wrapping_ variants to avoid silent overflow",
+                        self.fn_name
+                    ),
+                });
+            }
         }
         visit::visit_expr_binary(self, node);
     }
@@ -675,6 +886,7 @@ mod tests {
             source,
             &mut findings,
             &AuditConfig::default(),
+            source,
         )
         .unwrap();
         findings
@@ -770,10 +982,14 @@ mod tests {
         "#;
 
         let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
+        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
+            suppressions: &suppressions,
+            suppressions: &suppressions,
         };
         visitor.visit_file(&file);
 
@@ -796,10 +1012,12 @@ mod tests {
         "#;
 
         let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
+            suppressions: &suppressions,
         };
         visitor.visit_file(&file);
 
@@ -833,10 +1051,12 @@ mod tests {
         "#;
 
         let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
+            suppressions: &suppressions,
         };
         visitor.visit_file(&file);
 
@@ -870,10 +1090,12 @@ mod tests {
         "#;
 
         let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
+            suppressions: &suppressions,
         };
         visitor.visit_file(&file);
 
@@ -897,10 +1119,12 @@ mod tests {
         "#;
 
         let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
+            suppressions: &suppressions,
         };
         visitor.visit_file(&file);
 
