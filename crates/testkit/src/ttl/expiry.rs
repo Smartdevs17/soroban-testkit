@@ -160,6 +160,86 @@ impl TestEnv {
         }
     }
 
+    /// Assert that running `f` extends the TTL of **every** entry listed in
+    /// `keys` — a bulk version of [`assert_bumps_ttl`](Self::assert_bumps_ttl).
+    ///
+    /// Takes a slice of `(key, label)` tuples so the failure message can name
+    /// which key(s) did not bump.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] listing every key
+    /// whose TTL was not extended.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn touch_both(env: Env) {
+    ///         env.storage().persistent().extend_ttl(&symbol_short!("a"), 5_000, 10_000);
+    ///         env.storage().persistent().extend_ttl(&symbol_short!("b"), 5_000, 10_000);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// let a = symbol_short!("a");
+    /// let b = symbol_short!("b");
+    ///
+    /// env.assert_bumps_ttl_multi(&id, StorageKind::Persistent, &[
+    ///     (a, "key_a"),
+    ///     (b, "key_b"),
+    /// ], || {
+    ///     StoreClient::new(env.env(), &id).touch_both();
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_bumps_ttl_multi<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        keys: &[(K, &str)],
+        f: impl FnOnce(),
+    ) {
+        let befores: Vec<(Val, u32, &str)> = keys
+            .iter()
+            .map(|(k, label)| {
+                let key_val = k.into_val(self.env());
+                let ttl = self.ttl_of_val(contract, kind, &key_val);
+                (key_val, ttl, *label)
+            })
+            .collect();
+
+        f();
+
+        let mut failures = Vec::new();
+        for (key_val, before, label) in &befores {
+            let after = self.ttl_of_val(contract, kind, key_val);
+            if after <= *before {
+                failures.push(format!("{label}: expected > {before}, got {after}"));
+            }
+        }
+
+        if !failures.is_empty() {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the call to extend the {kind:?} TTL for all keys, but some did not:\n  {}",
+                    failures.join("\n  ")
+                ))
+            );
+        }
+    }
+
     /// Assert that `f` completes without panicking after every entry of
     /// `kind` has expired (via [`TestEnv::expire`]) — i.e. that the
     /// contract handles an expired/missing entry gracefully instead of
@@ -190,6 +270,143 @@ impl TestEnv {
                 TestkitError::AssertionFailed(format!(
                     "expected the contract to survive {kind:?} storage expiry gracefully, \
                      but it panicked: {}",
+                    panic_message(&payload)
+                ))
+            );
+        }
+    }
+
+    /// Assert that running `f` does **not** extend the TTL of the entry at
+    /// `contract`/`kind`/`key` — the inverse of [`assert_bumps_ttl`](Self::assert_bumps_ttl).
+    ///
+    /// Useful for verifying that a read-only function does not accidentally
+    /// write or touch storage it should not.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the before
+    /// and after TTLs if `f` *did* increase the TTL.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    ///     pub fn read_only(env: Env, key: Symbol) -> i128 {
+    ///         env.storage().persistent().get(&key).unwrap_or(0)
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// let client = StoreClient::new(env.env(), &id);
+    /// client.set(&symbol_short!("k"), &42);
+    ///
+    /// env.assert_no_ttl_bump(&id, StorageKind::Persistent, symbol_short!("k"), || {
+    ///     let _ = client.read_only(&symbol_short!("k"));
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_no_ttl_bump<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        f: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let before = self.ttl_of_val(contract, kind, &key_val);
+        f();
+        let after = self.ttl_of_val(contract, kind, &key_val);
+        if after > before {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the call to NOT extend the {kind:?} TTL, but it went from {before} to {after}"
+                ))
+            );
+        }
+    }
+
+    /// Advance the ledger to **one ledger before** the entry at `contract`/
+    /// `kind`/`key` expires, then run `f`.
+    ///
+    /// This lets you test that a contract correctly handles the last moment
+    /// before expiry — e.g. that it can still read the entry and extend it
+    /// in time, or that it gracefully degrades.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entry does not exist, has already expired, or if `f`
+    /// panics (in which case the panic message is forwarded).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    ///     pub fn touch(env: Env, key: Symbol) {
+    ///         env.storage().persistent().extend_ttl(&key, 5_000, 10_000);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// let client = StoreClient::new(env.env(), &id);
+    /// client.set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_runs_before_expiry(&id, StorageKind::Persistent, symbol_short!("k"), || {
+    ///     client.touch(&symbol_short!("k"));
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_runs_before_expiry<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        f: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let ttl = self.ttl_of_val(contract, kind, &key_val);
+        if ttl == 0 {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "cannot run before expiry: {kind:?} entry has already expired (TTL is 0)"
+                ))
+            );
+        }
+        // Advance to one ledger before expiry.
+        self.advance_ledgers(ttl.saturating_sub(1));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if let Err(payload) = result {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "closure panicked when run just before {kind:?} expiry: {}",
                     panic_message(&payload)
                 ))
             );
@@ -282,6 +499,93 @@ mod tests {
 
         env.assert_survives_expiry(StorageKind::Temporary, || {
             assert_eq!(client.read_temp_checked(), 0);
+        });
+    }
+
+    #[test]
+    fn assert_bumps_ttl_multi_passes_when_all_keys_bump() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        // touch_record_checked bumps Persistent TTL for DataKey::Record.
+        // Use the same key twice to exercise the multi-key path.
+        env.assert_bumps_ttl_multi(
+            &id,
+            StorageKind::Persistent,
+            &[(DataKey::Record, "record_1"), (DataKey::Record, "record_2")],
+            || {
+                client.touch_record_checked();
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the call to extend the Persistent TTL for all keys")]
+    fn assert_bumps_ttl_multi_fails_when_key_does_not_bump() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_bumps_ttl_multi(
+            &id,
+            StorageKind::Persistent,
+            &[(DataKey::Record, "record")],
+            || {
+                client.touch_record(); // reads without bumping
+            },
+        );
+    }
+
+    #[test]
+    fn assert_no_ttl_bump_passes_on_read_only() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_no_ttl_bump(&id, StorageKind::Persistent, DataKey::Record, || {
+            client.touch_record(); // reads without bumping
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the call to NOT extend the Persistent TTL")]
+    fn assert_no_ttl_bump_fails_when_ttl_is_extended() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_no_ttl_bump(&id, StorageKind::Persistent, DataKey::Record, || {
+            client.touch_record_checked(); // bumps TTL
+        });
+    }
+
+    #[test]
+    fn assert_runs_before_expiry_runs_closure() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_runs_before_expiry(&id, StorageKind::Persistent, DataKey::Record, || {
+            client.touch_record_checked();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "closure panicked when run just before")]
+    fn assert_runs_before_expiry_forwards_closure_panic() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_runs_before_expiry(&id, StorageKind::Persistent, DataKey::Record, || {
+            panic!("intentional test panic");
         });
     }
 }
