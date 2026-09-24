@@ -1218,6 +1218,10 @@ mod tests {
         let result = run(err_result);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().0;
-        assert!(err_msg.contains("failed to read"), "expected file error, got: {}", err_msg);
+        assert!(
+            err_msg.contains("failed to read"),
+            "expected file error, got: {}",
+            err_msg
+        );
     }
 }
