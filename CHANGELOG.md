@@ -77,6 +77,17 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- `coverage` command now provides a specific, actionable error message when
+  `cargo-llvm-cov` is not installed or not found in PATH, distinguishing
+  between the tool being missing and other subprocess errors.
+- `limits` command termination is now deterministic: search stops at a
+  built-in upper bound rather than when a non-deterministic condition is met,
+  and the output notes whether the ceiling was discovered or the upper bound
+  was reached.
+- `limits` diagnostics now include the first failed ramp value, helping users
+  understand where their contract hits resource limits.
+- `limits` and `coverage` commands now handle paths with spaces correctly in
+  baseline, export, and output operations.
 - `limits` never mocked authorization: every ramp attempt failed on a
   `require_auth` call before resource limits were ever reached. Each probe
   now uses `mock_all_auths_allowing_non_root_auth()` on its own
