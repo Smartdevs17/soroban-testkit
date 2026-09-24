@@ -36,6 +36,21 @@ pub enum TestkitError {
     /// the ledger clock backwards, or providing an invalid address label).
     #[error("misuse of testkit API: {0}")]
     Misuse(String),
+
+    /// Adds high-level context while preserving the nested [`TestkitError`]
+    /// as the standard error source.
+    ///
+    /// This is useful when a helper needs to explain *which operation* failed
+    /// without flattening the original error into a string and losing its
+    /// source chain.
+    #[error("{context}: {source}")]
+    Context {
+        /// Human-readable operation context.
+        context: String,
+        /// The underlying testkit error.
+        #[source]
+        source: Box<TestkitError>,
+    },
 }
 
 impl TestkitError {
@@ -93,7 +108,10 @@ impl TestkitError {
     /// assert!(!err.is_misuse());
     /// ```
     pub fn is_assertion_failed(&self) -> bool {
-        matches!(self, Self::AssertionFailed(_))
+        match self {
+            Self::Context { source, .. } => source.is_assertion_failed(),
+            other => matches!(other, Self::AssertionFailed(_)),
+        }
     }
 
     /// Returns `true` if this error is a [`DecodeFailed`](TestkitError::DecodeFailed).
@@ -108,7 +126,10 @@ impl TestkitError {
     /// assert!(!err.is_misuse());
     /// ```
     pub fn is_decode_failed(&self) -> bool {
-        matches!(self, Self::DecodeFailed(_))
+        match self {
+            Self::Context { source, .. } => source.is_decode_failed(),
+            other => matches!(other, Self::DecodeFailed(_)),
+        }
     }
 
     /// Returns `true` if this error is a [`Misuse`](TestkitError::Misuse).
@@ -123,7 +144,10 @@ impl TestkitError {
     /// assert!(!err.is_assertion_failed());
     /// ```
     pub fn is_misuse(&self) -> bool {
-        matches!(self, Self::Misuse(_))
+        match self {
+            Self::Context { source, .. } => source.is_misuse(),
+            other => matches!(other, Self::Misuse(_)),
+        }
     }
 
     /// The human-readable inner message for this error.
@@ -141,6 +165,7 @@ impl TestkitError {
             TestkitError::AssertionFailed(m)
             | TestkitError::DecodeFailed(m)
             | TestkitError::Misuse(m) => m.as_str(),
+            TestkitError::Context { source, .. } => source.message(),
         }
     }
 
@@ -231,6 +256,29 @@ impl TestkitError {
             TestkitError::AssertionFailed(_) => "TESTKIT_ASSERTION_FAILED",
             TestkitError::DecodeFailed(_) => "TESTKIT_DECODE_FAILED",
             TestkitError::Misuse(_) => "TESTKIT_MISUSE",
+            TestkitError::Context { source, .. } => source.code(),
+        }
+    }
+
+    /// Attach operation context without discarding this error's source chain.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::DecodeFailed("expected i128".into())
+    ///     .with_context("decoding transfer amount");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "decoding transfer amount: failed to decode value: expected i128"
+    /// );
+    /// assert_eq!(err.code(), "TESTKIT_DECODE_FAILED");
+    /// ```
+    pub fn with_context(self, context: impl Into<String>) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(self),
         }
     }
 
@@ -249,6 +297,7 @@ impl TestkitError {
             TestkitError::AssertionFailed { .. } => "AssertionFailed",
             TestkitError::DecodeFailed { .. } => "DecodeFailed",
             TestkitError::Misuse { .. } => "Misuse",
+            TestkitError::Context { source, .. } => source.kind(),
         }
     }
 
@@ -671,5 +720,39 @@ mod tests {
                 err.code()
             );
         }
+    }
+
+    #[test]
+    fn nested_context_keeps_the_full_display_chain() {
+        let err = TestkitError::DecodeFailed("expected i128, got Symbol".into())
+            .with_context("decoding transfer amount")
+            .with_context("reading transfer event");
+
+        assert_eq!(
+            err.to_string(),
+            "reading transfer event: decoding transfer amount: failed to decode value: expected i128, got Symbol"
+        );
+        assert_eq!(err.code(), "TESTKIT_DECODE_FAILED");
+    }
+
+    #[test]
+    fn nested_context_preserves_error_sources() {
+        use std::error::Error as _;
+
+        let err = TestkitError::Misuse("clock moved backwards".into())
+            .with_context("restoring ledger")
+            .with_context("running at() closure");
+
+        let first = err.source().expect("outer context must expose a source");
+        assert_eq!(
+            first.to_string(),
+            "restoring ledger: misuse of testkit API: clock moved backwards"
+        );
+        let second = first.source().expect("inner context must expose a source");
+        assert_eq!(
+            second.to_string(),
+            "misuse of testkit API: clock moved backwards"
+        );
+        assert!(second.source().is_none());
     }
 }

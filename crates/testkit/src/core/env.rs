@@ -281,8 +281,74 @@ pub struct TestEnv {
     labels: Mutex<LabelStore>,
 }
 
+/// Reusable test setup built around a [`TestEnv`].
+///
+/// Implement this trait for a fixture struct that owns a `TestEnv` plus the
+/// addresses, contracts, or tokens a group of tests share. The provided
+/// constructors keep environment creation consistent and make seeded fixtures
+/// reproducible without duplicating setup boilerplate.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::{TestEnv, TestFixture};
+/// use soroban_sdk::Address;
+///
+/// struct Fixture {
+///     env: TestEnv,
+///     alice: Address,
+/// }
+///
+/// impl TestFixture for Fixture {
+///     fn from_env(env: TestEnv) -> Self {
+///         let alice = env.address();
+///         Self { env, alice }
+///     }
+///
+///     fn test_env(&self) -> &TestEnv {
+///         &self.env
+///     }
+/// }
+///
+/// let a = Fixture::with_seed(7);
+/// let b = Fixture::with_seed(7);
+/// assert_eq!(a.alice, b.alice);
+/// ```
+pub trait TestFixture: Sized {
+    /// Build the fixture from an already-created test environment.
+    fn from_env(env: TestEnv) -> Self;
+
+    /// Borrow the environment owned by this fixture.
+    fn test_env(&self) -> &TestEnv;
+
+    /// Build the fixture around a fresh [`TestEnv`].
+    fn new() -> Self {
+        Self::from_env(TestEnv::new())
+    }
+
+    /// Build the fixture around a reproducibly seeded [`TestEnv`].
+    fn with_seed(seed: u64) -> Self {
+        Self::from_env(TestEnv::with_seed(seed))
+    }
+}
+
+impl TestFixture for TestEnv {
+    fn from_env(env: TestEnv) -> Self {
+        env
+    }
+
+    fn test_env(&self) -> &TestEnv {
+        self
+    }
+}
+
 impl TestEnv {
     /// Create a fresh environment with a deterministic starting ledger.
+    ///
+    /// Every `TestEnv` starts at ledger sequence `0` and Unix timestamp `0`.
+    /// These values are set explicitly rather than inherited from the SDK's
+    /// defaults so tests can rely on them across SDK upgrades. Other ledger
+    /// parameters continue to come from the current Soroban SDK test config.
     ///
     /// Uses a non-reproducible seed for any future randomized value
     /// generation; use [`TestEnv::with_seed`] when a test needs to be
@@ -499,29 +565,16 @@ impl TestEnv {
         let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
             capture_snapshot_at_drop: false,
         });
-        // Apply any LedgerDefaults overrides so the starting ledger is
-        // deterministic. We only mutate the fields the caller specified;
-        // unset fields keep the SDK's own defaults.
-        if defaults.timestamp.is_some()
-            || defaults.sequence_number.is_some()
-            || defaults.protocol_version.is_some()
-            || defaults.base_reserve.is_some()
-        {
-            let mut info = env.ledger().get();
-            if let Some(ts) = defaults.timestamp {
-                info.timestamp = ts;
-            }
-            if let Some(seq) = defaults.sequence_number {
-                info.sequence_number = seq;
-            }
-            if let Some(pv) = defaults.protocol_version {
-                info.protocol_version = pv;
-            }
-            if let Some(br) = defaults.base_reserve {
-                info.base_reserve = br;
-            }
-            env.ledger().set(info);
+        let mut info = env.ledger().get();
+        info.sequence_number = defaults.sequence_number.unwrap_or(0);
+        info.timestamp = defaults.timestamp.unwrap_or(0);
+        if let Some(pv) = defaults.protocol_version {
+            info.protocol_version = pv;
         }
+        if let Some(br) = defaults.base_reserve {
+            info.base_reserve = br;
+        }
+        env.ledger().set(info);
         env
     }
 
@@ -1335,6 +1388,98 @@ impl<'a> std::iter::FusedIterator for AddressIter<'a> {}
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Ledger;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    fn benchmark_batch(mut make: impl FnMut(usize)) -> Duration {
+        const SAMPLES: usize = 64;
+        for i in 0..4 {
+            make(i);
+        }
+        let started = Instant::now();
+        for i in 0..SAMPLES {
+            make(i);
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn construction_cost_stays_close_to_the_raw_sdk_env() {
+        let raw = benchmark_batch(|_| {
+            black_box(TestEnv::fresh_env_with_defaults(&LedgerDefaults::default()));
+        });
+        let wrapped = benchmark_batch(|i| {
+            black_box(TestEnv::with_seed(i as u64));
+        });
+
+        // TestEnv construction should remain little more than constructing the
+        // SDK Env and storing its small amount of configuration. The fixed
+        // 50ms allowance keeps this guard stable on noisy CI runners while
+        // still catching accidental I/O, sleeps, or other heavyweight setup.
+        let budget = raw.saturating_mul(3) + Duration::from_millis(50);
+        assert!(
+            wrapped <= budget,
+            "constructing TestEnv regressed: wrapped={wrapped:?}, raw={raw:?}, budget={budget:?}"
+        );
+    }
+
+    #[test]
+    fn new_uses_the_documented_starting_ledger() {
+        let env = TestEnv::new();
+        let ledger = env.env().ledger().get();
+        assert_eq!(ledger.sequence_number, 0);
+        assert_eq!(ledger.timestamp, 0);
+    }
+
+    struct Fixture {
+        env: TestEnv,
+        first: Address,
+    }
+
+    impl TestFixture for Fixture {
+        fn from_env(env: TestEnv) -> Self {
+            let first = env.address();
+            Self { env, first }
+        }
+
+        fn test_env(&self) -> &TestEnv {
+            &self.env
+        }
+    }
+
+    #[test]
+    fn fixture_with_seed_is_reproducible() {
+        let a = Fixture::with_seed(42);
+        let b = Fixture::with_seed(42);
+        assert_eq!(a.first, b.first);
+        assert_eq!(a.test_env().seed(), 42);
+        assert_eq!(b.test_env().seed(), 42);
+    }
+
+    #[test]
+    fn fixture_new_environments_are_isolated() {
+        let a = Fixture::new();
+        let b = Fixture::new();
+        a.test_env().env().ledger().set_sequence_number(9_999);
+        assert_ne!(a.test_env().sequence(), b.test_env().sequence());
+    }
+
+    #[test]
+    fn fixture_accepts_zero_seed_and_existing_env_configuration() {
+        let zero = Fixture::with_seed(0);
+        assert_eq!(zero.test_env().seed(), 0);
+
+        let configured = Fixture::from_env(TestEnv::with_seed(7).with_ledger_close_interval(2));
+        assert_eq!(configured.test_env().seed(), 7);
+        assert_eq!(configured.test_env().ledger_close_interval(), 2);
+    }
+
+    #[test]
+    fn test_env_itself_implements_fixture() {
+        let env = <TestEnv as TestFixture>::with_seed(11);
+        assert_eq!(env.seed(), 11);
+        assert!(std::ptr::eq(<TestEnv as TestFixture>::test_env(&env), &env));
+    }
 
     #[test]
     fn new_twice_produces_independent_environments() {
