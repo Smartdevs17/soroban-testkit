@@ -51,6 +51,26 @@ fn audit_reports_no_findings_on_a_clean_directory() {
 }
 
 #[test]
+fn audit_json_output_is_parseable() {
+    let output = run(&["audit", "examples/vault/src", "--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tool"], "soroban-testkit");
+    assert!(report["summary"]["finding_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn audit_sarif_output_is_parseable() {
+    let output = run(&["audit", "examples/vault/src", "--format", "sarif"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["version"], "2.1.0");
+    assert!(report["runs"][0]["results"]
+        .as_array()
+        .is_some_and(|results| !results.is_empty()));
+}
+
+#[test]
 fn audit_scans_macro_entry_points_from_stdin() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
         .args(["audit", "-"])

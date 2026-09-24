@@ -1874,6 +1874,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
+ "serde_json",
  "soroban-sdk",
  "soroban-spec",
  "syn 3.0.5",
