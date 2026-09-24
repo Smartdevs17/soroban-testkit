@@ -19,3 +19,5 @@ syn = { version = "3.0.5", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2.5.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
