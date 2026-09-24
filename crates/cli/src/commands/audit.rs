@@ -39,6 +39,8 @@ enum AuditCommand {
         /// Rule ID to explain.
         rule: String,
     },
+    /// List all rules with their descriptions in machine-readable format.
+    Rules,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -113,8 +115,10 @@ impl Finding {
 /// 6. Signed `amount` parameters with no comparison against zero.
 /// 7. Unchecked timestamp arithmetic operations that could overflow.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    if let Some(AuditCommand::Explain { rule }) = &args.command {
-        return explain_rule(rule);
+    match &args.command {
+        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
+        Some(AuditCommand::Rules) => return list_rules(args.format),
+        None => {}
     }
 
     let config = load_config(&args.path)?;
@@ -206,6 +210,78 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
     };
     println!("{}", explanation);
     Ok(())
+}
+
+/// Static metadata for all audit rules.
+const RULES: &[(&str, &str, &str)] = &[
+    ("missing-require-auth", "warning", "Entry points that accept an Address parameter must validate the caller with require_auth()."),
+    ("unchecked-i128-arithmetic", "warning", "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants."),
+    ("missing-ttl-bump", "warning", "Storage reads without extend_ttl can expire prematurely."),
+    ("broad-mock-all-auths", "warning", "Test functions using mock_all_auths() bypass auth checks entirely."),
+    ("ignored-token-transfer-result", "warning", "Token transfer operations can fail; their results must be handled."),
+    ("missing-positive-amount-validation", "warning", "Signed amount parameters should be validated against zero."),
+    ("unchecked-timestamp-arithmetic", "warning", "Timestamp arithmetic can overflow and cause silent failures."),
+];
+
+fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
+    match format {
+        AuditOutputFormat::Text => {
+            println!("{:<40} {:<10} {}", "RULE", "SEVERITY", "DESCRIPTION");
+            println!("{}", "-".repeat(100));
+            for (rule, severity, desc) in RULES {
+                println!("{rule:<40} {severity:<10} {desc}");
+            }
+            Ok(())
+        }
+        AuditOutputFormat::Json => {
+            let rules: Vec<_> = RULES
+                .iter()
+                .map(|(id, severity, description)| {
+                    serde_json::json!({
+                        "id": id,
+                        "severity": severity,
+                        "description": description,
+                    })
+                })
+                .collect();
+            let report = serde_json::json!({
+                "tool": "soroban-testkit",
+                "version": 1,
+                "rules": rules,
+                "summary": { "rule_count": rules.len() },
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            Ok(())
+        }
+        AuditOutputFormat::Sarif => {
+            let rules: Vec<_> = RULES
+                .iter()
+                .map(|(id, severity, description)| {
+                    serde_json::json!({
+                        "id": id,
+                        "shortDescription": { "text": id.replace('-', " ") },
+                        "fullDescription": { "text": description },
+                        "defaultConfiguration": {
+                            "level": match *severity {
+                                "error" => "error",
+                                _ => "warning",
+                            }
+                        },
+                    })
+                })
+                .collect();
+            let report = serde_json::json!({
+                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                "version": "2.1.0",
+                "runs": [{
+                    "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+                    "results": []
+                }]
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            Ok(())
+        }
+    }
 }
 
 fn render_findings(findings: &[Finding], format: AuditOutputFormat) -> Result<String, CliError> {
