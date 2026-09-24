@@ -51,6 +51,29 @@ fn audit_reports_no_findings_on_a_clean_directory() {
 }
 
 #[test]
+fn audit_scans_macro_entry_points_from_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args(["audit", "-"])
+        .current_dir(workspace_root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run soroban-testkit");
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        br#"#[contractimpl] impl Contract { fn transfer(env: Env, from: Address) { let value: i128 = 1; let _ = value + 1i128; } }"#,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("<stdin>"), "{stdout}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("unchecked-i128-arithmetic"), "{stdout}");
+}
+
+#[test]
 fn limits_finds_the_real_mainnet_write_ceiling_for_batch_payout() {
     let build = Command::new("cargo")
         .args([

@@ -82,9 +82,7 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     })?;
 
     if !status.success() {
-        return Err(CliError(format!(
-            "coverage run failed (cargo llvm-cov exited with {status})"
-        )));
+        return Err(CliError(coverage_failure_message(status)));
     }
 
     validate_coverage_outputs(&args)?;
@@ -92,59 +90,17 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliError> {
-    match args.format {
-        Format::Text => Ok(()),
-        Format::Lcov => {
-            let output_path = if let Some(dir) = &args.output_dir {
-                dir.join("lcov.info")
-            } else {
-                std::path::PathBuf::from("lcov.info")
-            };
+fn coverage_failure_message(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
 
-            if !output_path.exists() {
-                return Err(CliError(format!(
-                    "coverage output file not found at {}; \
-                     the coverage tool may have failed to generate the output — \
-                     check the coverage run output above for errors",
-                    output_path.display()
-                )));
-            }
-
-            let contents = std::fs::read_to_string(&output_path).map_err(|err| {
-                CliError(format!(
-                    "failed to read coverage output at {}: {err}",
-                    output_path.display()
-                ))
-            })?;
-
-            if contents.trim().is_empty() {
-                return Err(CliError(format!(
-                    "coverage output file at {} is empty; \
-                     this usually indicates that no tests ran or no code was covered",
-                    output_path.display()
-                )));
-            }
-
-            Ok(())
-        }
-        Format::Html => {
-            let output_dir = args.output_dir.as_ref().map(|p| p.as_path())
-                .unwrap_or(std::path::Path::new("."));
-            let index_path = output_dir.join("index.html");
-
-            if !index_path.exists() {
-                return Err(CliError(format!(
-                    "coverage HTML report not found at {}; \
-                     the coverage tool may have failed to generate the report — \
-                     check the coverage run output above for errors",
-                    index_path.display()
-                )));
-            }
-
-            Ok(())
+        if let Some(signal) = status.signal() {
+            return format!("coverage run terminated by signal {signal}");
         }
     }
+
+    format!("coverage run failed (cargo llvm-cov exited with {status})")
 }
 
 /// Builds the `cargo llvm-cov` invocation for `args`, without running it —
@@ -200,6 +156,11 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
     }
 
     if let Some(pct) = args.fail_under {
+        if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+            return Err(CliError(format!(
+                "--fail-under must be between 0 and 100 (got {pct})"
+            )));
+        }
         cmd.arg("--fail-under-lines").arg(pct.to_string());
     }
 
@@ -308,6 +269,25 @@ mod tests {
                 "90",
             ]
         );
+    }
+
+    #[test]
+    fn fail_under_must_be_between_zero_and_one_hundred() {
+        for pct in [-0.1, 100.1, f64::NAN, f64::INFINITY] {
+            let mut a = args(&[], &[]);
+            a.fail_under = Some(pct);
+            let err = build_command(&a).unwrap_err();
+            assert!(err.0.contains("between 0 and 100"), "{}", err.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_termination_is_reported_distinctly() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9));
+        assert_eq!(message, "coverage run terminated by signal 9");
     }
 
     #[test]

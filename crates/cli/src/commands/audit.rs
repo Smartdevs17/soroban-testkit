@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
@@ -13,7 +14,7 @@ use super::CliError;
 #[derive(Args)]
 pub struct AuditArgs {
     /// Path to the contract crate to audit (its `.rs` files are scanned
-    /// recursively).
+    /// recursively), or `-` to scan Rust source from stdin.
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
     /// Exit non-zero if any findings are reported.
@@ -43,14 +44,22 @@ struct Finding {
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let mut findings = Vec::new();
 
-    for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
+    if args.path == Path::new("-") {
+        let mut source = String::new();
+        std::io::stdin()
+            .read_to_string(&mut source)
+            .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
+        audit_source(Path::new("<stdin>"), &source, &mut findings)?;
+    } else {
+        for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry.path().extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            audit_file(entry.path(), &mut findings)?;
         }
-        if entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        audit_file(entry.path(), &mut findings)?;
     }
 
     if findings.is_empty() {
@@ -85,7 +94,11 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
 fn audit_file(path: &Path, findings: &mut Vec<Finding>) -> Result<(), CliError> {
     let src = std::fs::read_to_string(path)
         .map_err(|err| CliError(format!("failed to read {}: {err}", path.display())))?;
-    let file = match syn::parse_file(&src) {
+    audit_source(path, &src, findings)
+}
+
+fn audit_source(path: &Path, src: &str, findings: &mut Vec<Finding>) -> Result<(), CliError> {
+    let file = match syn::parse_file(src) {
         Ok(file) => file,
         Err(_) => return Ok(()), // Not every .rs file under a crate root need parse standalone.
     };
@@ -286,4 +299,56 @@ impl I128ArithmeticVisitor<'_> {
 
 fn type_is_i128(ty: &Type) -> bool {
     matches!(ty, Type::Path(p) if p.path.is_ident("i128"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audit_source_for_test(source: &str) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        audit_source(Path::new("<test>"), source, &mut findings).unwrap();
+        findings
+    }
+
+    #[test]
+    fn macro_expanded_entry_point_is_scanned() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contract]
+            pub struct Contract;
+            #[contractimpl]
+            impl Contract {
+                pub fn transfer(env: Env, from: Address) {
+                    env.storage().instance().set(&from, &1i128);
+                }
+            }
+            "#,
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn authorized_macro_entry_point_has_no_auth_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn transfer(env: Env, from: Address) {
+                    from.require_auth();
+                }
+            }
+            "#,
+        );
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn empty_source_is_a_clean_edge_case() {
+        assert!(audit_source_for_test("").is_empty());
+    }
 }

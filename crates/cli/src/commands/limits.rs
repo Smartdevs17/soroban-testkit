@@ -108,6 +108,8 @@ pub struct ProbeArgs {
 /// constraint). Only CPU instructions and memory, available locally via
 /// the host's budget, are reported.
 pub fn run(args: LimitsArgs) -> Result<(), CliError> {
+    validate_percentage("--baseline-tolerance-pct", args.baseline_tolerance_pct)?;
+
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
     // ramp) up front, in-process, before spawning any probes — this is
@@ -272,6 +274,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         println!("exported results to {}", export_path.display());
     }
 
+    Ok(())
+}
+
+fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
+    if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+        return Err(CliError(format!(
+            "{name} must be between 0 and 100 (got {pct})"
+        )));
+    }
     Ok(())
 }
 
@@ -1041,6 +1052,14 @@ mod tests {
             .unwrap()
             .expect("should not have timed out");
         assert!(status.success());
+    }
+
+    #[test]
+    fn baseline_tolerance_must_be_between_zero_and_one_hundred() {
+        for pct in [-0.1, 100.1, f64::NAN, f64::INFINITY] {
+            let err = validate_percentage("--baseline-tolerance-pct", pct).unwrap_err();
+            assert!(err.0.contains("between 0 and 100"), "{}", err.0);
+        }
     }
 
     #[test]
