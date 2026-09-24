@@ -95,9 +95,22 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
   --fn batch_payout --ramp recipients
 
 # Static checks: missing require_auth, unchecked i128 arithmetic,
-# storage reads with no TTL bump. Not a security product.
+# storage reads with no TTL bump, ignored token-transfer results, and
+# signed amount parameters with no positive-value validation.
 soroban-testkit audit ./src --strict
+
+# Stable machine-readable reports for automation and GitHub code scanning.
+soroban-testkit audit ./src --format json
+soroban-testkit audit ./src --format sarif > audit.sarif
 ```
+
+`audit --format json` emits a versioned object with `findings` and a finding
+count. `audit --format sarif` emits SARIF 2.1.0 with a rule ID, severity,
+message, file URI, and start line for every finding. `--strict` remains
+independent of presentation format and exits non-zero after writing the report
+when findings exist. Audit rules can be disabled or assigned a custom severity
+in `.soroban-testkit.toml` by their IDs, including
+`ignored-token-transfer-result` and `missing-positive-amount-validation`.
 
 `limits` ramps a numeric parameter directly, or generates addresses for a
 `Vec<Address>` parameter — the common "how many recipients" question.
